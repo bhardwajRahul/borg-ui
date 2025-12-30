@@ -136,6 +136,15 @@ async def update_repository_stats(repository: Repository, db: Session) -> bool:
                          repository=repository.name,
                          error=str(e))
 
+        # Get filesystem storage usage
+        storage_info = await get_filesystem_usage(repository)
+        if storage_info:
+            repository.storage_total = storage_info["total"]
+            repository.storage_used = storage_info["used"]
+            repository.storage_available = storage_info["available"]
+            repository.storage_percent_used = storage_info["percent_used"]
+            repository.last_storage_check = datetime.now(timezone.utc)
+
         # Update repository
         old_count = repository.archive_count
         old_size = repository.total_size
@@ -149,7 +158,8 @@ async def update_repository_stats(repository: Repository, db: Session) -> bool:
                   archive_count_old=old_count,
                   archive_count_new=archive_count,
                   size_old=old_size,
-                  size_new=total_size)
+                  size_new=total_size,
+                  storage_info=bool(storage_info))
         return True
 
     except Exception as e:
@@ -171,6 +181,167 @@ def format_bytes(bytes_size: int) -> str:
 def format_datetime(dt):
     """Format datetime to ISO8601 with UTC timezone indicator"""
     return serialize_datetime(dt)
+
+# Helper function to get filesystem disk usage
+async def get_filesystem_usage(repository: Repository) -> Optional[Dict[str, Any]]:
+    """
+    Get filesystem disk usage for repository location.
+    Supports both local and SSH repositories.
+
+    Returns dict with:
+    - total: Total space in bytes
+    - used: Used space in bytes
+    - available: Available space in bytes
+    - percent_used: Percentage used (0-100)
+    - filesystem: Filesystem type
+    - mount_point: Mount point path
+    """
+    try:
+        if repository.repository_type == "local":
+            # For local repositories, use Python's shutil
+            import shutil
+
+            # Get the repository path (extract the actual filesystem path)
+            repo_path = repository.path
+            if "::" in repo_path:
+                repo_path = repo_path.split("::")[0]
+
+            # Get disk usage
+            usage = shutil.disk_usage(repo_path)
+
+            return {
+                "total": usage.total,
+                "used": usage.used,
+                "available": usage.free,
+                "percent_used": round((usage.used / usage.total) * 100, 2) if usage.total > 0 else 0,
+                "filesystem": "local",
+                "mount_point": repo_path
+            }
+
+        elif repository.repository_type == "ssh":
+            # For SSH repositories, run df command remotely
+            if not repository.host or not repository.username or not repository.ssh_key_id:
+                logger.warning("SSH repository missing required fields for storage check",
+                             repository=repository.name)
+                return None
+
+            # Get SSH key
+            from app.database.models import SSHKey
+            from cryptography.fernet import Fernet
+            import base64
+            import tempfile
+
+            ssh_key = None
+            temp_key_file = None
+
+            try:
+                # Get database session
+                from app.database.database import get_db
+                db = next(get_db())
+                ssh_key = db.query(SSHKey).filter(SSHKey.id == repository.ssh_key_id).first()
+
+                if not ssh_key:
+                    logger.warning("SSH key not found",
+                                 repository=repository.name,
+                                 ssh_key_id=repository.ssh_key_id)
+                    return None
+
+                # Decrypt private key
+                encryption_key = settings.secret_key.encode()[:32]
+                cipher = Fernet(base64.urlsafe_b64encode(encryption_key))
+                private_key = cipher.decrypt(ssh_key.private_key.encode()).decode()
+
+                if not private_key.endswith('\n'):
+                    private_key += '\n'
+
+                # Create temporary key file
+                with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+                    f.write(private_key)
+                    temp_key_file = f.name
+
+                os.chmod(temp_key_file, 0o600)
+
+                # Extract remote path from repository path
+                # Format: user@host:path or user@host:/path
+                repo_path = repository.path
+                if "::" in repo_path:
+                    repo_path = repo_path.split("::")[0]
+
+                # Extract path from SSH format
+                if ":" in repo_path:
+                    remote_path = repo_path.split(":", 1)[1]
+                else:
+                    remote_path = repo_path
+
+                # Run df command on remote host to get filesystem info
+                df_cmd = [
+                    "ssh",
+                    "-i", temp_key_file,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "LogLevel=ERROR",
+                    "-o", "ConnectTimeout=10",
+                    "-p", str(repository.port),
+                    f"{repository.username}@{repository.host}",
+                    f"df -k {remote_path} | tail -1"
+                ]
+
+                process = await asyncio.create_subprocess_exec(
+                    *df_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+
+                if process.returncode == 0:
+                    # Parse df output
+                    # Format: Filesystem 1K-blocks Used Available Use% Mounted
+                    output = stdout.decode().strip()
+                    parts = output.split()
+
+                    if len(parts) >= 5:
+                        total_kb = int(parts[1])
+                        used_kb = int(parts[2])
+                        available_kb = int(parts[3])
+                        percent_str = parts[4].rstrip('%')
+
+                        return {
+                            "total": total_kb * 1024,  # Convert to bytes
+                            "used": used_kb * 1024,
+                            "available": available_kb * 1024,
+                            "percent_used": float(percent_str),
+                            "filesystem": parts[0],
+                            "mount_point": parts[5] if len(parts) > 5 else remote_path
+                        }
+                else:
+                    logger.warning("Failed to get remote disk usage",
+                                 repository=repository.name,
+                                 error=stderr.decode())
+                    return None
+
+            finally:
+                # Clean up temporary key file
+                if temp_key_file and os.path.exists(temp_key_file):
+                    try:
+                        os.unlink(temp_key_file)
+                    except:
+                        pass
+
+        else:
+            logger.warning("Unsupported repository type for storage check",
+                         repository=repository.name,
+                         repository_type=repository.repository_type)
+            return None
+
+    except asyncio.TimeoutError:
+        logger.warning("Timeout getting filesystem usage",
+                     repository=repository.name)
+        return None
+    except Exception as e:
+        logger.error("Failed to get filesystem usage",
+                   repository=repository.name,
+                   error=str(e))
+        return None
 
 # Pydantic models
 from pydantic import BaseModel
@@ -745,7 +916,21 @@ async def get_repository(
         
         # Get repository statistics
         stats = await get_repository_stats(repository.path)
-        
+
+        # Add storage information if available
+        storage = None
+        if repository.storage_total is not None:
+            storage = {
+                "total": repository.storage_total,
+                "total_formatted": format_bytes(repository.storage_total),
+                "used": repository.storage_used,
+                "used_formatted": format_bytes(repository.storage_used),
+                "available": repository.storage_available,
+                "available_formatted": format_bytes(repository.storage_available),
+                "percent_used": repository.storage_percent_used,
+                "last_check": format_datetime(repository.last_storage_check) if repository.last_storage_check else None
+            }
+
         return {
             "success": True,
             "repository": {
@@ -759,7 +944,8 @@ async def get_repository(
                 "archive_count": repository.archive_count,
                 "created_at": format_datetime(repository.created_at),
                 "updated_at": format_datetime(repository.updated_at),
-                "stats": stats
+                "stats": stats,
+                "storage": storage
             }
         }
     except HTTPException:
@@ -1087,18 +1273,33 @@ async def get_repository_statistics(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get repository statistics"""
+    """Get repository statistics including filesystem storage usage"""
     try:
         repository = db.query(Repository).filter(Repository.id == repo_id).first()
         if not repository:
             raise HTTPException(status_code=404, detail="Repository not found")
-        
+
         # Get detailed statistics
         stats = await get_repository_stats(repository.path)
-        
+
+        # Add storage information if available
+        storage = None
+        if repository.storage_total is not None:
+            storage = {
+                "total": repository.storage_total,
+                "total_formatted": format_bytes(repository.storage_total),
+                "used": repository.storage_used,
+                "used_formatted": format_bytes(repository.storage_used),
+                "available": repository.storage_available,
+                "available_formatted": format_bytes(repository.storage_available),
+                "percent_used": repository.storage_percent_used,
+                "last_check": format_datetime(repository.last_storage_check) if repository.last_storage_check else None
+            }
+
         return {
             "success": True,
-            "stats": stats
+            "stats": stats,
+            "storage": storage
         }
     except HTTPException:
         raise

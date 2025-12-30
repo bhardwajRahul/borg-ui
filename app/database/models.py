@@ -75,6 +75,13 @@ class Repository(Base):
     notify_on_check_success = Column(Boolean, default=False, nullable=False)  # Per-repository override
     notify_on_check_failure = Column(Boolean, default=True, nullable=False)  # Per-repository override
 
+    # Filesystem storage information
+    storage_total = Column(BigInteger, nullable=True)  # Total storage in bytes
+    storage_used = Column(BigInteger, nullable=True)  # Used storage in bytes
+    storage_available = Column(BigInteger, nullable=True)  # Available storage in bytes
+    storage_percent_used = Column(Float, nullable=True)  # Percentage of storage used
+    last_storage_check = Column(DateTime, nullable=True)  # Last time storage was checked
+
     # Relationships
     ssh_key = relationship("SSHKey", back_populates="repositories")
 
