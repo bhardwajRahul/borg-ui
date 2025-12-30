@@ -70,6 +70,16 @@ interface Repository {
   mode: 'full' | 'observe' // full: backups + observability, observe: observability-only
   custom_flags?: string | null // Custom command-line flags for borg create
   has_running_maintenance?: boolean
+  storage?: {
+    total: number
+    total_formatted: string
+    used: number
+    used_formatted: string
+    available: number
+    available_formatted: string
+    percent_used: number
+    last_check: string | null
+  }
 }
 
 interface SSHKey {

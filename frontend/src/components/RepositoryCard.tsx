@@ -22,6 +22,16 @@ interface Repository {
   updated_at: string | null
   mode: 'full' | 'observe'
   has_running_maintenance?: boolean
+  storage?: {
+    total: number
+    total_formatted: string
+    used: number
+    used_formatted: string
+    available: number
+    available_formatted: string
+    percent_used: number
+    last_check: string | null
+  }
 }
 
 interface RepositoryCardProps {
@@ -242,6 +252,49 @@ export default function RepositoryCard({
                 {repository.source_directories.length === 1 ? 'path' : 'paths'}
               </Typography>
             </Box>
+          )}
+
+          {repository.storage && (
+            <>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  Storage Used
+                </Typography>
+                <Tooltip
+                  title={`${repository.storage.used_formatted} of ${repository.storage.total_formatted} used (${repository.storage.percent_used.toFixed(1)}%)`}
+                  arrow
+                >
+                  <Typography variant="body2" fontWeight={500} sx={{ cursor: 'help' }}>
+                    {repository.storage.used_formatted}
+                  </Typography>
+                </Tooltip>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  Storage Available
+                </Typography>
+                <Tooltip
+                  title={`${repository.storage.available_formatted} available (${(100 - repository.storage.percent_used).toFixed(1)}% free)`}
+                  arrow
+                >
+                  <Typography
+                    variant="body2"
+                    fontWeight={500}
+                    sx={{
+                      cursor: 'help',
+                      color:
+                        repository.storage.percent_used > 90
+                          ? 'error.main'
+                          : repository.storage.percent_used > 75
+                            ? 'warning.main'
+                            : 'inherit',
+                    }}
+                  >
+                    {repository.storage.available_formatted}
+                  </Typography>
+                </Tooltip>
+              </Box>
+            </>
           )}
         </Box>
 
